@@ -435,6 +435,7 @@ def generate(model, idx, max_new_tokens, temperature=1.0, do_sample=False, top_k
     Most likely you'll want to make sure to be in model.eval() mode of operation for this.
     """
     block_size = model.get_block_size()
+    done = torch.zeros(idx.size(0), dtype=torch.bool, device=idx.device)
     for _ in range(max_new_tokens):
         # if the sequence context is growing too long we must crop it at block_size
         idx_cond = idx if idx.size(1) <= block_size else idx[:, -block_size:]
@@ -453,8 +454,13 @@ def generate(model, idx, max_new_tokens, temperature=1.0, do_sample=False, top_k
             idx_next = torch.multinomial(probs, num_samples=1)
         else:
             _, idx_next = torch.topk(probs, k=1, dim=-1)
+        # sequences that already emitted STOP keep emitting STOP (token 0)
+        idx_next[done] = 0
+        done = done | (idx_next.squeeze(1) == 0)
         # append sampled index to the running sequence and continue
         idx = torch.cat((idx, idx_next), dim=1)
+        if done.all():
+            break
 
     return idx
 
@@ -560,8 +566,15 @@ class CharDataset(Dataset):
         self.words = words
         self.chars = chars
         self.max_word_length = max_word_length
-        self.stoi = {ch:i+1 for i,ch in enumerate(self.chars)} # bijection 'V13' <-> 13
-        self.itos = {i:s for s,i in self.stoi.items()} # inverse mapping: 13 -> 'V13'
+        #***THIS DICTIONARY IS CREATED INCORRECTLY IF A TOKEN GOES UNUSED, USUALLY MAKING A KEYERROR
+        #self.stoi = {ch:i+1 for i,ch in enumerate(self.chars)} # bijection 'V13' <-> 13 
+        #self.itos = {i:s for s,i in self.stoi.items()} # inverse mapping: 13 -> 'V13'
+        #THIS IS BETTER
+        # Determine the highest index from the available character tokens
+        max_index = max(int(ch[1:]) for ch in self.chars)  # Extract numbers from 'Vx' tokens
+        # Create a full mapping from V0 to V[max_index], regardless of if there are gaps
+        self.stoi = {f"V{i}": i + 1 for i in range(max_index + 1)}  # V0 -> 1, V1 -> 2, ..., Vmax -> max+1
+        self.itos = {i: s for s, i in self.stoi.items()}  # Inverse mapping
 
     def __len__(self):
         return len(self.words)
@@ -664,8 +677,11 @@ class InfiniteDataLoader:
     a better way in PyTorch to just create an infinite dataloader?
     """
 
-    def __init__(self, dataset, **kwargs):
-        train_sampler = torch.utils.data.RandomSampler(dataset, replacement=True, num_samples=int(1e10))
+    def __init__(self, dataset, weights=None, **kwargs):
+        if weights is not None:
+            train_sampler = torch.utils.data.WeightedRandomSampler(weights, num_samples=int(1e10), replacement=True)
+        else:
+            train_sampler = torch.utils.data.RandomSampler(dataset, replacement=True, num_samples=int(1e10))
         self.train_loader = DataLoader(dataset, sampler=train_sampler, **kwargs)
         self.data_iter = iter(self.train_loader)
 

@@ -1,0 +1,22 @@
+# Experiment outputs
+checkpoint/
+
+# Repo-specific docs not intended for public
+CLAUDE.md
+summary.txt
+code ideas/
+
+# Julia
+@v1.12/
+*.ji
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
+
+# Claude Code project settings
+.claude/

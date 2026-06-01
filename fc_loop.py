@@ -1,4 +1,5 @@
 import subprocess
+from collections import deque
 from slurm import init_signal_handler, init_distributed_mode
 from utils import bool_flag, initialize_exp
 import numpy as np
@@ -12,7 +13,7 @@ from tokenizers.pre_tokenizers import Whitespace
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, ConcatDataset
 from torch.utils.data.dataloader import DataLoader
 from dataclasses import dataclass
 from typing import List
@@ -20,7 +21,14 @@ from typing import List
 from makemoretokens import ModelConfig, CharDataset, Transformer, Bigram, MLP, RNN, BoW, InfiniteDataLoader, evaluate, generate
 import os
 import argparse
+import psutil
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+def log_memory(label=""):
+    mps_alloc = torch.mps.current_allocated_memory() / (1024**2)
+    mps_res   = torch.mps.driver_allocated_memory() / (1024**2)
+    rss       = psutil.Process().memory_info().rss / (1024**2)
+    logger.info(f"[mem]{' ' + label if label else ''} | MPS alloc: {mps_alloc:.0f}MB reserved: {mps_res:.0f}MB | RAM RSS: {rss:.0f}MB")
 
 def get_parser():
     parser = argparse.ArgumentParser('Generate training sample of low braids via reservoir sampling')
@@ -32,7 +40,9 @@ def get_parser():
     parser.add_argument('--sample-only', type=int, default=500000, help="sample the specified number from the model in each loop")
     parser.add_argument('--nb_threads', type=int, default=1, help='Number of cpu threads')
     parser.add_argument('--nb_local_searches', type=int, default=1200, help='This only matters when using multithreading, then it should be a multiple of the number of threads used')
-    
+    parser.add_argument('--max_search_iter', type=int, default=10000,
+                        help='Max greedy iterations per local search call (inner loop budget)')
+
 
     # Makemore params
     parser.add_argument('--num-workers', '-n', type=int, default=8, help="number of data workers for both train/test")
@@ -52,10 +62,14 @@ def get_parser():
     parser.add_argument('--learning-rate', '-l', type=float, default=5e-4, help="learning rate")
     parser.add_argument('--weight-decay', '-w', type=float, default=0.01, help="weight decay")
     # evaluation against known "good sequences"
-    parser.add_argument('--max-output-length', type=int, default=160, help="maximum output length")
+    parser.add_argument('--max-output-length', type=int, default=130, help="maximum output length")
     parser.add_argument('--gen_batch_size', type=int, default=1000, help="generation batch size")
-    parser.add_argument('--n_tokens', type=int, default=100, help="nr tokens in tokenizer")
+    parser.add_argument('--n_tokens', type=int, default=400, help="nr tokens in tokenizer")
     parser.add_argument('--temperature', type=float, default=1.0, help="temperature")
+    parser.add_argument('--history_decay', type=float, default=0.0,
+                        help="Exponential decay factor for past generations in training (0.0 = use only latest)")
+    parser.add_argument('--history_window', type=int, default=5,
+                        help="Max number of past generations to keep in training mix")
     
 
     # path and ports
@@ -65,6 +79,8 @@ def get_parser():
                         help="Experiment name")
     parser.add_argument("--exp_id", type=str, default="",
                         help="Experiment ID")
+    parser.add_argument("--warmstart_file", type=str, default="",
+                        help="Path to a file of constructions to seed Julia's first generation (skips empty-object rollouts)")
     parser.add_argument("--local_rank", type=int, default=-1,
                         help="Multi-GPU - Local rank")
     parser.add_argument("--master_port", type=int, default=-1,
@@ -87,9 +103,17 @@ def tokenize(input_file_path, n_tokens):
     tokenizer_file = directory_name + "/tokenizer.json"
 
     if os.path.exists(tokenizer_file):
-        logger.info(f"Loading tokenizer from {tokenizer_file}...")
         tokenizer = Tokenizer.from_file(tokenizer_file)
+        if tokenizer.get_vocab_size() != n_tokens:
+            logger.info(f"Tokenizer vocab size {tokenizer.get_vocab_size()} != n_tokens {n_tokens}, retraining...")
+            os.remove(tokenizer_file)
+            tokenizer = None
+        else:
+            logger.info(f"Loading tokenizer from {tokenizer_file}...")
     else:
+        tokenizer = None
+
+    if tokenizer is None:
         tokenizer = Tokenizer(BPE())
         tokenizer.pre_tokenizer = Whitespace()
     
@@ -99,9 +123,8 @@ def tokenize(input_file_path, n_tokens):
         destination_file_path = args.dump_path+"/temp.txt"
 
         logger.info(f'Created {destination_file_path} and training tokenizer...')
-        # Reading the first 100,000 lines from the source file and training the tokenizer on them
         with open(source_file_path, 'r') as source_file, open(destination_file_path, 'w') as destination_file:
-            for i in range(5_000):
+            for i in range(50_000):
                 line = source_file.readline()
                 if not line:
                     break
@@ -195,8 +218,12 @@ def create_datasets(input_file):
     test_set_size = min(1000, int(len(words) * 0.1)) # 10% of the training set, or up to 1000 examples
 
     rp = torch.randperm(len(words)).tolist()
-    train_words = [words[i] for i in rp[:-test_set_size]]
-    test_words = [words[i] for i in rp[-test_set_size:]]
+    if test_set_size > 0:
+        train_words = [words[i] for i in rp[:-test_set_size]]
+        test_words = [words[i] for i in rp[-test_set_size:]]
+    else:
+        train_words = [words[i] for i in rp]
+        test_words = []
     logger.info(f"split up the dataset into {len(train_words)} training examples and {len(test_words)} test examples")
     
     # wrap in dataset objects
@@ -249,6 +276,48 @@ def write_samples(num=10, new_file=False, use_logger=False):
     return n_samp, sum_samp, max_samp
 
 
+def start_julia_daemon(args):
+    """Start Julia as a persistent daemon. Blocks until Julia signals READY after building tables."""
+    os.environ["JULIA_NUM_THREADS"] = str(args.nb_threads)
+    logger.info(f"JULIA_NUM_THREADS is set to {os.environ['JULIA_NUM_THREADS']}")
+    proc = subprocess.Popen(
+        ["julia", "search_fc.jl",
+         args.dump_path, str(args.nb_local_searches),
+         str(args.num_initial_empty_objects), str(args.final_database_size),
+         str(args.target_db_size), str(args.max_search_iter)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    logger.info("Waiting for Julia daemon to signal READY...")
+    while True:
+        line = proc.stdout.readline()
+        if not line:
+            raise RuntimeError("Julia daemon exited before signaling READY")
+        line = line.rstrip('\n')
+        if line == "READY":
+            logger.info("Julia daemon is READY.")
+            break
+        logger.info(f"[julia] {line}")
+    return proc
+
+
+def run_julia_generation(proc, input_file=""):
+    """Send one generation to the Julia daemon and wait for DONE."""
+    msg = f"RUN {input_file}\n" if input_file else "RUN\n"
+    proc.stdin.write(msg)
+    proc.stdin.flush()
+    while True:
+        line = proc.stdout.readline()
+        if not line:
+            raise RuntimeError("Julia daemon exited unexpectedly during generation")
+        line = line.rstrip('\n')
+        if line == "DONE":
+            break
+        logger.info(f"[julia] {line}")
+
+
 if __name__ == '__main__':
     parser = get_parser()
     args = parser.parse_args()
@@ -259,14 +328,14 @@ if __name__ == '__main__':
     if args.is_slurm_job:
         init_signal_handler()
     
-    args.device = "cpu" if args.cpu else "cuda"
+    args.device = "cpu" if args.cpu else "mps"
     if args.seed < 0:
         args.seed = np.random.randint(1_000_000_000)
     logger.info(f"seed: {args.seed}")
 
     # system inits
     torch.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
+    torch.mps.manual_seed(args.seed)
     # os.makedirs(args.work_dir, exist_ok=True)
 
     # init datasets
@@ -274,10 +343,9 @@ if __name__ == '__main__':
         if not os.path.isfile(f"{args.dump_path}/search_output_{i}-tokenized.txt"):
             break
     initial_gen = i-1
+    julia_proc = start_julia_daemon(args)
     if initial_gen == 0:
-        os.environ["JULIA_NUM_THREADS"] = str(args.nb_threads)  # Set the environment variable
-        logger.info(f"JULIA_NUM_THREADS is set to {os.environ['JULIA_NUM_THREADS']}")
-        subprocess.run(["julia","search_fc.jl", args.dump_path, str(args.nb_local_searches), str(args.num_initial_empty_objects), str(args.final_database_size), str(args.target_db_size)])
+        run_julia_generation(julia_proc, args.warmstart_file)
         tokenize(f"{args.dump_path}/search_output_1.txt", args.n_tokens)
         initial_gen = 1
     
@@ -314,18 +382,30 @@ if __name__ == '__main__':
         model.load_state_dict(torch.load(model_path))
 
 
+    dataset_history = deque()
+    dataset_history.append((train_dataset, test_dataset))
+
     for generation in range(initial_gen,args.max_epochs + 1):
         logger.info(f"============ Start of generation {generation} ============")
-        logger.info(f"Memory allocated:  {torch.cuda.memory_allocated(0)/(1024*1024):.2f}MB, reserved: {torch.cuda.memory_reserved(0)/(1024*1024):.2f}MB")
+        log_memory("start of generation")
 
         logger.info("training")
-        # python makemoretokens.py --i search_output_1-tokenized.txt --device cuda
-        #train_makemore()
         # init optimizer
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay, betas=(0.9, 0.99), eps=1e-8)
 
         # init dataloader
-        batch_loader = InfiniteDataLoader(train_dataset, batch_size=args.batch_size, pin_memory=True, num_workers=args.num_workers)
+        if args.history_decay > 0 and len(dataset_history) > 1:
+            combined = ConcatDataset([ds for ds, _ in dataset_history])
+            weights = []
+            for k, (ds, _) in enumerate(dataset_history):
+                w = args.history_decay ** (len(dataset_history) - 1 - k)
+                weights.extend([w] * len(ds))
+            sample_weights = torch.tensor(weights, dtype=torch.float)
+            batch_loader = InfiniteDataLoader(combined, weights=sample_weights, batch_size=args.batch_size, pin_memory=True, num_workers=args.num_workers)
+            logger.info(f"Training on {len(dataset_history)} generations ({len(combined)} total examples) with decay={args.history_decay}")
+        else:
+            batch_loader = InfiniteDataLoader(train_dataset, batch_size=args.batch_size, pin_memory=True, num_workers=args.num_workers)
+        log_memory("after dataloader init")
 
         # training loop
         best_loss = None
@@ -357,9 +437,9 @@ if __name__ == '__main__':
 
             
 
-            # wait for all CUDA work on the GPU to finish then calculate iteration time taken
-            if args.device =="cuda":
-                torch.cuda.synchronize()
+            # wait for all mps work on the GPU to finish then calculate iteration time taken
+            if args.device =="mps":
+                torch.mps.synchronize()
             t1 = time.time()
 
             # logging
@@ -371,6 +451,7 @@ if __name__ == '__main__':
                 train_loss = evaluate(model, train_dataset, args.device, batch_size=100, max_batches=10)
                 test_loss  = evaluate(model, test_dataset,  args.device, batch_size=100, max_batches=10)
                 logger.info(f"step {step} train loss: {train_loss} test loss: {test_loss}")
+                log_memory(f"step {step}")
                 # save the model to disk if it has improved
                 if best_loss is None or test_loss < best_loss:
                     out_path = os.path.join(args.dump_path, "model.pt")
@@ -383,8 +464,9 @@ if __name__ == '__main__':
             # termination conditions
             if args.max_steps >= 0 and step >= args.max_steps:
                 break
-        logger.info(f"Memory allocated:  {torch.cuda.memory_allocated(0)/(1024*1024):.2f}MB, reserved: {torch.cuda.memory_reserved(0)/(1024*1024):.2f}MB")
-
+        log_memory("end of training")
+        torch.mps.empty_cache()
+        log_memory("after empty_cache pre-generation")
         logger.info('generating')
         sample_batch_size =args.gen_batch_size # reduce this if GPU crashes, increase it if sampling is slow
         todo = args.sample_only
@@ -414,15 +496,17 @@ if __name__ == '__main__':
         tot_sum+=sm
         tot_max = max(tot_max,mx)
         logger.info(f"distribution of sample lengths: average: {tot_sum/tot_n if tot_n != 0 else 0} max: {tot_max}")
+        if args.device == "mps":
+            torch.mps.empty_cache()
+        log_memory("after generation, pre-decode")
         logger.info('decoding')
         decode()
-        logger.info(f"Memory allocated:  {torch.cuda.memory_allocated(0)/(1024*1024):.2f}MB, reserved: {torch.cuda.memory_reserved(0)/(1024*1024):.2f}MB")
+        if args.device == "mps":
+            torch.mps.empty_cache()
+        log_memory("end of generation")
         logger.info(f"============ End of generation {generation} ============")
         logger.info(f"launching search.jl")
-        os.environ["JULIA_NUM_THREADS"] = str(args.nb_threads)  # Set the environment variable
-        logger.info(f"JULIA_NUM_THREADS is set to {os.environ['JULIA_NUM_THREADS']}")
-
-        subprocess.run(["julia", "search_fc.jl", args.dump_path, str(args.nb_local_searches), str(args.num_initial_empty_objects), str(args.final_database_size), str(args.target_db_size), '-i', args.dump_path + '/transformer-output-decoded.txt'])
+        run_julia_generation(julia_proc, args.dump_path + '/transformer-output-decoded.txt')
         if os.path.exists(args.dump_path+"/distribution.txt"):
             with open(args.dump_path+"/distribution.txt", 'r') as file:
                 d_lines = file.readlines()
@@ -435,5 +519,10 @@ if __name__ == '__main__':
         tokenize(f"{args.dump_path}/search_output_{generation+1}.txt", args.n_tokens)
         input_file = args.dump_path + f"/search_output_{generation+1}-tokenized.txt"
         train_dataset, test_dataset = create_datasets(input_file)
-        
+        dataset_history.append((train_dataset, test_dataset))
+        if len(dataset_history) > args.history_window:
+            dataset_history.popleft()
 
+    julia_proc.stdin.write("QUIT\n")
+    julia_proc.stdin.flush()
+    julia_proc.wait()

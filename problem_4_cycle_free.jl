@@ -82,8 +82,8 @@ function greedy_search_from_startpoint(db, obj::OBJ_TYPE, additional_loops=0)::V
     Greedily remove edges to destroy all triangles, then greedily add edges without creating triangles
     Returns final maximal triangle-free graph
     """
-    num_commas = count(c -> c == ',', obj)
-    if num_commas != N - 1
+    num_twos = count(c -> c == '2', obj)
+    if num_twos != N - 1
         return greedy_search_from_startpoint(db, empty_starting_point())
     end
 
@@ -93,7 +93,7 @@ function greedy_search_from_startpoint(db, obj::OBJ_TYPE, additional_loops=0)::V
     index = 1
     for i in 1:N-1
         for j in i+1:N
-            while obj[index] == ','
+            while obj[index] == '2'
                 index += 1
             end
             #println(obj[index])

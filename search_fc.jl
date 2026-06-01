@@ -11,9 +11,17 @@ using Dates
 
 # Choose the problem to work on here!
 
-#include("problem_triangle_free.jl")  
-include("problem_4_cycle_free.jl")
+#include("problem_triangle_free.jl")
+#include("problem_4_cycle_free.jl")
 #include("problem_permanent_avoid_123.jl")
+#include("problem_longestrbpath.jl")
+#include("problem_3uniform_ramsey.jl")
+#include("problem_3color_ramsey.jl")
+#include("problem_asymmetric_ramsey_table.jl")
+#include("problem_asymmetric_ramsey_circulant.jl")
+#include("problem_asymmetric_ramsey_circulant_v2.jl")
+#include("problem_SA_weighted_asymmetric_ramsey.jl")
+include("problem_kneser_vertex_ramsey.jl")
 
 
 #########################################################################################
@@ -39,6 +47,10 @@ end
 
 function write_output_to_file(db)
     rewards = [ rew for rew in keys(db.rewards) ]
+    if isempty(rewards)
+        println("Warning: database is empty, nothing to write.")
+        return
+    end
     sort!(rewards, rev=true)
     base_name = "search_output"
     extension = "txt"
@@ -64,6 +76,10 @@ end
 
 function write_plot_to_file(db)
     rewards = [ rew for rew in keys(db.rewards) ]
+    if isempty(rewards)
+        println("Warning: database is empty, skipping plot.")
+        return
+    end
     sort!(rewards, rev=true)
     reward_counts = [ length(db.rewards[rew]) for rew in rewards ]
 
@@ -133,17 +149,15 @@ function new_db()
 end
 
 
-function initial_lines()
-    input_file = ""
-    for arg in ARGS
-        if arg == "-i" || arg == "--input"
-            input_file_index = findfirst(==(arg), ARGS) + 1
-            if input_file_index <= length(ARGS)
-                input_file = ARGS[input_file_index]
-            end
-            break
-        end
+# Default valid_line: accept lines whose length matches empty_starting_point().
+# Problem files can override this (e.g. for variable-length encodings).
+if !@isdefined(valid_line)
+    function valid_line(line::String)
+        return length(line) == length(empty_starting_point())
     end
+end
+
+function get_lines(input_file::String)
     println("Input file: ", input_file)  # Debug print
 
     lines = String[]  # Create an empty vector of strings
@@ -151,12 +165,12 @@ function initial_lines()
         println("Using input file")
         open(input_file, "r") do file
             for line in eachline(file)
-                if length(line) == length(empty_starting_point())
+                if valid_line(line)
                     push!(lines, line)  # Add each line to the vector
                 end
             end
         end
-    else 
+    else
         println("No input file provided")
         for _ in 1:num_initial_empty_objects
             push!(lines, empty_starting_point())
@@ -212,10 +226,8 @@ end
 
 
 function local_search!(db, lines, start_ind, nb=nb_local_searches)
-    local_search_results_threads = []
-    for j=1:nthreads()
-        push!(local_search_results_threads, [[],[]])
-    end
+    n_thread_slots = isdefined(Threads, :maxthreadid) ? Threads.maxthreadid() : nthreads()
+    local_search_results_threads = [[[], []] for _ in 1:n_thread_slots]
     # prepare local search pool
     count = 0
     pool = OBJ_TYPE[]
@@ -227,7 +239,7 @@ function local_search!(db, lines, start_ind, nb=nb_local_searches)
         append!(local_search_results_threads[threadid()][2], list_rew)
     end
     # we update the dictionaries
-    for j=1:nthreads()
+    for j=1:n_thread_slots
         # we consider all new graphs found by j-th thread
         # Remark: a tiny number of graphs could be found by multiple threads, this is not a problem, the function add! will add each graph only once
         add_db!(db, local_search_results_threads[j][1], local_search_results_threads[j][2])
@@ -329,9 +341,9 @@ function shrink!(db)
     return nothing
 end
 
-function main()
-    db = new_db() 
-    lines = initial_lines()
+function run_generation(input_file::String)
+    db = new_db()
+    lines = get_lines(input_file)
     println(length(lines))
     println(length(Set(lines)))
     print("Using ")
@@ -347,7 +359,7 @@ function main()
         start_idx += nb_local_searches
         steps += 1
         time_local_search = round(time_local_search, digits=2)
-        print_db(db)        
+        print_db(db)
     end
     print_db(db)
     write_output_to_file(db)
@@ -356,11 +368,28 @@ end
 
 
 write_path = ARGS[1]
-nb_local_searches = parse(Int,ARGS[2]) 
+nb_local_searches = parse(Int,ARGS[2])
 num_initial_empty_objects = parse(Int,ARGS[3])
 final_database_size = parse(Int,ARGS[4])
 target_db_size = parse(Int,ARGS[5])
-main()
+max_search_iter = parse(Int,ARGS[6])
+
+println("READY")
+flush(stdout)
+
+while true
+    msg = readline(stdin)
+    (isempty(msg) || msg == "QUIT") && break
+
+    # msg format: "RUN {input_file_path}" or "RUN"
+    parts = split(msg, " ", limit=2)
+    input_file = length(parts) == 2 ? String(parts[2]) : ""
+
+    run_generation(input_file)
+
+    println("DONE")
+    flush(stdout)
+end
 
 
 
